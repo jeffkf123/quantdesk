@@ -1,6 +1,8 @@
 services:
   api:
-    build: ./docker
+    build:
+      context: .            # <- build from repo root
+      dockerfile: docker/Dockerfile
     env_file: .env.example
     volumes:
       - ./:/app
