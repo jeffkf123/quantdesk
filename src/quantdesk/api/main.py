@@ -6,9 +6,17 @@ from quantdesk.analytics.rates.bootstrapping import discount_factor, forward_rat
 from quantdesk.logging_conf import setup_logging
 from quantdesk.config import settings
 from quantdesk.data.store.treasury_reader import load_curve
+from quantdesk.data.store.treasury_reader import (
+    load_curve,
+    iter_dates,
+    load_curve_or_none,
+)
 from quantdesk.analytics.rates.zero_curve import make_curve_from_cc_points, dv01_zero
 setup_logging(settings.log_level)
-
+from pathlib import Path
+from quantdesk.data.store.price_reader import load_price_series, compute_returns
+from quantdesk.data.store.fred_reader import load_series
+import pandas as pd
 app = FastAPI(title="QuantDesk API", version="0.1.0")
 
 class BSRequest(BaseModel):
@@ -58,6 +66,20 @@ def rates_fwd(t1: float, t2: float, r1: float, r2: float) -> dict:
 # --- Treasury curve endpoint (points + spreads) ---
 from quantdesk.data.store.treasury_reader import load_curve
 from pathlib import Path
+
+def _make_zero_curve_for_date(date: str, base_dir: str | None = None):
+    """
+    Load the partition for `date`, then fit a log-DF piecewise-linear zero curve
+    from cc_rate_approx points. Returns (curve, df_rows) or raises FileNotFoundError.
+    """
+    df = load_curve(date, base_dir=Path(base_dir) if base_dir else None)
+    pts = [
+        (float(r["tenor_years"]), float(r["cc_rate_approx"]))
+        for _, r in df.iterrows()
+        if float(r["tenor_years"]) > 0
+    ]
+    crv = make_curve_from_cc_points(pts)
+    return crv, df
 
 def _to_points(df):
     return [
@@ -214,3 +236,180 @@ def rates_dv01(date: str, keys: str | None = None, base_dir: str | None = None):
     K = _parse_grid(keys) if keys else [0.25, 2.0, 5.0, 10.0, 30.0]
     dv = [dv01_zero(t, crv) for t in K]
     return {"date": date, "keys": K, "dv01": dv, "method": "dv01_zero_from_logdf_curve"}
+
+
+
+
+@app.get("/rates/forwards/zero")
+def rates_forwards_zero(date: str, pairs: str | None = None, base_dir: str | None = None):
+    """
+    Precise continuous-compounded forwards computed from the fitted zero curve:
+      f_{t1,t2} = (r(t2)*t2 - r(t1)*t1) / (t2 - t1), where r(.) are zero CC rates.
+    - date: YYYY-MM-DD
+    - pairs: "2,10;0.25,10" (years). If omitted, defaults to common pairs.
+    """
+    try:
+        crv, _ = _make_zero_curve_for_date(date, base_dir)
+    except FileNotFoundError as e:
+        return {"date": date, "forwards": [], "error": str(e)}
+
+    req_pairs: list[tuple[float, float]] = []
+    if pairs:
+        for chunk in pairs.split(";"):
+            if not chunk.strip():
+                continue
+            a, b = chunk.split(",")
+            t1, t2 = float(a), float(b)
+            if t2 > t1:
+                req_pairs.append((t1, t2))
+    else:
+        req_pairs = [(1.0, 2.0), (2.0, 5.0), (5.0, 10.0), (0.25, 10.0)]
+
+    forwards = []
+    bad = []
+    for t1, t2 in req_pairs:
+        try:
+            fwd = crv.fwd_cc(t1, t2)
+            forwards.append({"t1": t1, "t2": t2, "fwd_cc": fwd})
+        except Exception as ex:
+            bad.append({"t1": t1, "t2": t2, "error": str(ex)})
+
+    out = {"date": date, "forwards": forwards, "method": "zero_curve_fwd_cc"}
+    if bad:
+        out["failed_pairs"] = bad
+    return out
+
+
+@app.get("/rates/zero/history")
+def rates_zero_history(start: str, end: str, grid: str | None = None, base_dir: str | None = None):
+    """
+    Return daily zero CC rates (and DFs) evaluated on `grid` for all available days in [start,end].
+    Skips missing partitions (e.g., weekends/holidays).
+    Response:
+      {
+        "start": "...", "end": "...", "grid": [...],
+        "series": [
+          {"date": "YYYY-MM-DD", "zeros_cc": [...], "dfs": [...]},
+          ...
+        ]
+      }
+    """
+    G = _parse_grid(grid) if "_parse_grid" in globals() else [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0]
+    series = []
+    for ds in iter_dates(start, end):
+        df = load_curve_or_none(ds, base_dir=Path(base_dir) if base_dir else None)
+        if df is None or df.empty:
+            continue
+        pts = [
+            (float(r["tenor_years"]), float(r["cc_rate_approx"]))
+            for _, r in df.iterrows()
+            if float(r["tenor_years"]) > 0
+        ]
+        try:
+            crv = make_curve_from_cc_points(pts)
+        except Exception:
+            # If the day's points are pathological, skip gracefully
+            continue
+        zeros = [crv.zero_cc(t) for t in G]
+        dfs = [crv.df(t) for t in G]
+        series.append({"date": ds, "zeros_cc": zeros, "dfs": dfs})
+
+    return {"start": start, "end": end, "grid": G, "series": series, "method": "logdf_piecewise_linear_from_cc_approx"}
+
+
+@app.get("/macro/series/{series_id}")
+def macro_series(
+    series_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    features: bool = True,
+    base_dir: str | None = None,
+):
+    """
+    Return a FRED macro series (CPI, PCE, UNRATE, DFF, etc.) with optional features:
+      - YoY (%), 12-month change (monthly-like)
+      - 3m annualized (%), ((v/v[-3])^(12/3)-1)*100
+    Params:
+      - start/end: YYYY-MM-DD (optional)
+      - features: bool (default True)
+      - base_dir: overrides default data root
+    """
+    df = load_series(series_id, base_dir=Path(base_dir) if base_dir else None)
+    if start:
+        df = df[df["date"] >= pd.to_datetime(start)]
+    if end:
+        df = df[df["date"] <= pd.to_datetime(end)]
+
+    # compute features if requested (same logic as ingestor)
+    if features:
+        # inline feature computation (no hard import of ingestor to avoid cycles)
+        value = df["value"].astype("float64")
+        out = df.copy()
+        out = out.sort_values("date").reset_index(drop=True)
+        out["value_yoy"] = (value / value.shift(12) - 1.0) * 100.0
+        ratio_3m = value / value.shift(3)
+        out["value_3m_ann"] = (ratio_3m ** (12.0 / 3.0) - 1.0) * 100.0
+        df = out
+
+    # shape a compact JSON
+    series = [
+        {
+            "date": d.date().isoformat() if hasattr(d, "date") else str(d)[:10],
+            "value": None if (pd.isna(v) if v is not None else True) else float(v),
+            **(
+                {} if not features else {
+                    "value_yoy": None if (pd.isna(y) if 'y' in locals() else pd.isna(df.loc[i, 'value_yoy'])) else float(df.loc[i, 'value_yoy']),
+                    "value_3m_ann": None if (pd.isna(df.loc[i, 'value_3m_ann'])) else float(df.loc[i, 'value_3m_ann']),
+                }
+            ),
+        }
+        for i, (d, v) in enumerate(zip(df["date"], df["value"]))
+    ]
+
+    return {
+        "series_id": series_id,
+        "count": len(series),
+        "start": start,
+        "end": end,
+        "features": features,
+        "data": series,
+    }
+
+
+@app.get("/prices/daily")
+def prices_daily(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    adjusted: bool = True,
+    base_dir: str | None = None,
+):
+    """
+    Return daily OHLCV for a symbol + 1D returns.
+    Symbol format:
+      - US stocks/ETFs: 'spy' or 'spy.us' (we normalize to 'spy.us').
+    """
+    df = load_price_series(symbol, base_dir=Path(base_dir) if base_dir else None)
+    if df.empty:
+        return {"symbol": symbol, "data": []}
+    if start:
+        df = df[df["date"] >= pd.to_datetime(start)]
+    if end:
+        df = df[df["date"] <= pd.to_datetime(end)]
+    df = compute_returns(df, adjusted=adjusted)
+    data = [
+        {
+            "date": d.date().isoformat(),
+            "open": float(o),
+            "high": float(h),
+            "low": float(l),
+            "close": float(c),
+            "volume": None if pd.isna(v) else float(v),
+            "adjusted_close": float(ac),
+            "ret_1d": None if pd.isna(r) else float(r),
+        }
+        for d, o, h, l, c, v, ac, r in zip(
+            df["date"], df["open"], df["high"], df["low"], df["close"], df["volume"], df["adjusted_close"], df["ret_1d"]
+        )
+    ]
+    return {"symbol": symbol, "adjusted": adjusted, "count": len(data), "data": data}
