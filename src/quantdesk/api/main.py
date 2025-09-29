@@ -16,6 +16,9 @@ setup_logging(settings.log_level)
 from pathlib import Path
 from quantdesk.data.store.price_reader import load_price_series, compute_returns
 from quantdesk.data.store.fred_reader import load_series
+from quantdesk.data.store.options_reader import load_chain, list_asofs, list_expirations
+from quantdesk.data.store.price_reader import load_price_series
+from quantdesk.analytics.options.black_scholes import bs_price, implied_volatility 
 import pandas as pd
 app = FastAPI(title="QuantDesk API", version="0.1.0")
 
@@ -102,6 +105,26 @@ def _spreads(df):
     if 10.0 in by_tenor and 0.25 in by_tenor:
         out["3m10y"] = by_tenor[10.0] - by_tenor[0.25]
     return out
+
+
+def _infer_spot(symbol: str, asof: str | None, chain_df: pd.DataFrame, base_dir: str | None) -> float | None:
+    # 1) Prefer spot_hint from ingestor if present
+    if "spot_hint" in chain_df.columns:
+        x = pd.to_numeric(chain_df["spot_hint"], errors="coerce").dropna()
+        if not x.empty and x.iloc[0] > 0:
+            return float(x.iloc[0])
+    # 2) Fallback to latest close at/just before asof
+    try:
+        px = load_price_series(symbol, base_dir=Path(base_dir) if base_dir else None)
+        if not px.empty:
+            if asof:
+                px = px[px["date"] <= pd.to_datetime(asof)]
+            if not px.empty:
+                return float(px.iloc[-1]["close"])
+    except Exception:
+        pass
+    return None
+
 
 @app.get("/rates/curve")
 def rates_curve(date: str, base_dir: str | None = None):
@@ -413,3 +436,95 @@ def prices_daily(
         )
     ]
     return {"symbol": symbol, "adjusted": adjusted, "count": len(data), "data": data}
+
+
+@app.get("/options/meta")
+def options_meta(symbol: str, base_dir: str | None = None):
+    sym = symbol.upper()
+    asofs = list_asofs(sym, base_dir=Path(base_dir) if base_dir else None)
+    out = {"symbol": sym, "asofs": asofs}
+    if asofs:
+        out["expirations_latest"] = list_expirations(sym, asofs[-1], base_dir=Path(base_dir) if base_dir else None)
+    return out
+
+
+@app.get("/options/chain")
+def options_chain(
+    symbol: str,
+    expiration: str,
+    asof: str | None = None,
+    with_greeks: bool = True,
+    r_annual: float | None = None,   # risk-free (e.g., 0.04 = 4%); if None, can be extended to pull from Treasury
+    q_annual: float = 0.0,           # dividend yield (simple placeholder; can enhance later)
+    spot: float | None = None,       # override spot; otherwise inferred
+    base_dir: str | None = None,
+):
+    """
+    Return an options chain (calls+puts) for a given expiry and as-of partition.
+    If with_greeks=True, compute Black–Scholes Greeks with:
+      - S = provided spot OR inferred from prices
+      - K = strike
+      - r = r_annual (continuous); default None
+      - q = q_annual (continuous); default 0
+      - T = year fraction to expiration from asof
+      - sigma = IV from chain row (if available)
+    """
+    df = load_chain(symbol, expiration, asof=asof, base_dir=Path(base_dir) if base_dir else None)
+    if df.empty:
+        return {"symbol": symbol, "expiration": expiration, "asof": asof, "rows": []}
+
+    # infer asof if not provided (comes from partition)
+    if asof is None:
+        asof = str(df["asof"].iloc[0])
+
+    # enrich: compute greeks if requested
+    rows = []
+    S = spot or _infer_spot(symbol, asof, df, base_dir)
+    # year fraction (actual/365)
+    try:
+        T_years = (pd.to_datetime(expiration) - pd.to_datetime(asof)).days / 365.0
+    except Exception:
+        T_years = None
+
+    for _, r in df.iterrows():
+        row = {
+            "type": r["type"],
+            "strike": None if pd.isna(r["strike"]) else float(r["strike"]),
+            "last": None if pd.isna(r["last"]) else float(r["last"]),
+            "bid": None if pd.isna(r["bid"]) else float(r["bid"]),
+            "ask": None if pd.isna(r["ask"]) else float(r["ask"]),
+            "mid": None if pd.isna(r["mid"]) else float(r["mid"]),
+            "volume": None if pd.isna(r["volume"]) else float(r["volume"]),
+            "open_interest": None if pd.isna(r["open_interest"]) else float(r["open_interest"]),
+            "iv": None if pd.isna(r.get("iv", None)) else float(r["iv"]),
+            "in_the_money": bool(r.get("in_the_money", False)),
+            "contract": r.get("contract"),
+        }
+        if with_greeks and S and T_years and row["iv"] and row["strike"]:
+            try:
+                # Black–Scholes price with our provided parameters
+                # If your bs module exposes greeks directly, call them; otherwise you can compute delta/gamma/vega with your utility.
+                # Here we at least return the theoretical price so users can compare vs mid.
+                theo = bs_price(
+                    S=float(S),
+                    K=float(row["strike"]),
+                    r=float(r_annual or 0.0),
+                    q=float(q_annual or 0.0),
+                    T=float(max(T_years, 1e-6)),
+                    sigma=float(row["iv"]),
+                    option_type="call" if r["type"] == "call" else "put",
+                )
+                row["theo"] = float(theo)
+            except Exception:
+                row["theo"] = None
+        rows.append(row)
+
+    return {
+        "symbol": symbol.upper(),
+        "asof": asof,
+        "expiration": expiration,
+        "spot": S,
+        "r_annual": r_annual,
+        "q_annual": q_annual,
+        "rows": rows,
+    }
